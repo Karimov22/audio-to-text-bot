@@ -1,0 +1,5 @@
+python-telegram-bot==20.7
+SpeechRecognition==3.10.1
+pydub==0.25.1
+python-docx==1.1.0
+reportlab==4.1.0
