@@ -3,7 +3,6 @@ import logging
 import tempfile
 import datetime
 import asyncio
-from io import BytesIO
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -13,11 +12,13 @@ from telegram.ext import (
 
 import speech_recognition as sr
 from pydub import AudioSegment
-from docx import Document
+from docx import Document as DocxDocument
+import fitz  # PyMuPDF
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.units import cm
+import edge_tts
 
 # ===================== SOZLAMALAR =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "BU_YERGA_TOKEN_QOYING")
@@ -29,13 +30,19 @@ LANGUAGES = {
     "🇹🇷 Turkcha": "tr-TR",
 }
 
+TTS_VOICES = {
+    "uz-UZ": "uz-UZ-MadinaNeural",
+    "ru-RU": "ru-RU-SvetlanaNeural",
+    "en-US": "en-US-GuyNeural",
+    "tr-TR": "tr-TR-EmelNeural",
+}
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Foydalanuvchi sozlamalari (xotirada saqlanadi)
 user_settings = {}
 
 
@@ -85,10 +92,31 @@ def recognize_audio(wav_path, language="uz-UZ"):
     return " ".join(texts) if texts else None
 
 
-def make_docx(text, audio_name):
-    doc = Document()
-    doc.add_heading("Audio Transkriptsiya", 0).alignment = 1
-    doc.add_paragraph(f"Fayl: {audio_name}")
+def extract_text_from_file(file_path, ext):
+    """PDF yoki DOCX dan matn ajratish"""
+    if ext == ".pdf":
+        doc = fitz.open(file_path)
+        text = "".join([page.get_text() for page in doc])
+        return text.strip()
+    elif ext == ".docx":
+        doc = DocxDocument(file_path)
+        text = "\n".join([p.text for p in doc.paragraphs])
+        return text.strip()
+    return None
+
+
+async def text_to_audio(text, lang, output_path):
+    """Matnni audio ga aylantirish (edge-tts)"""
+    voice = TTS_VOICES.get(lang, "uz-UZ-MadinaNeural")
+    clean_text = text.replace('\n', ' ').strip()[:5000]
+    communicate = edge_tts.Communicate(clean_text, voice, rate="+10%")
+    await communicate.save(output_path)
+
+
+def make_docx(text, source_name):
+    doc = DocxDocument()
+    doc.add_heading("Transkriptsiya", 0).alignment = 1
+    doc.add_paragraph(f"Manba: {source_name}")
     doc.add_paragraph(f"Sana: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
     doc.add_paragraph("─" * 50)
     doc.add_paragraph()
@@ -113,7 +141,7 @@ def make_docx(text, audio_name):
     return tmp
 
 
-def make_pdf(text, audio_name):
+def make_pdf(text, source_name):
     tmp = tempfile.mktemp(suffix=".pdf")
     doc_pdf = SimpleDocTemplate(tmp, pagesize=A4,
                                 rightMargin=2*cm, leftMargin=2*cm,
@@ -124,9 +152,9 @@ def make_pdf(text, audio_name):
     body_style = ParagraphStyle("B", parent=styles["Normal"], fontSize=11, leading=16, spaceAfter=8)
 
     story = [
-        Paragraph("Audio Transkriptsiya", title_style),
+        Paragraph("Transkriptsiya", title_style),
         Spacer(1, 0.3*cm),
-        Paragraph(f"Fayl: {audio_name}", meta_style),
+        Paragraph(f"Manba: {source_name}", meta_style),
         Paragraph(f"Sana: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", meta_style),
         Spacer(1, 0.4*cm),
         Paragraph("─" * 60, meta_style),
@@ -163,12 +191,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         f"👋 Salom, *{name}*!\n\n"
-        "🎙️ Men audio xabarlarni matnga aylantirib, *PDF* yoki *DOCX* fayl qilib beraman.\n\n"
-        "📌 *Qanday foydalanish:*\n"
-        "1️⃣ /til — tilni tanlang\n"
-        "2️⃣ /format — chiqish formatini tanlang\n"
-        "3️⃣ Audio yuboring (ovozli xabar yoki MP3/OGG fayl)\n\n"
-        "⚡ Boshlash uchun audio yuboring!"
+        "Men ikki xil vazifani bajaraman:\n\n"
+        "🎙️ *Audio → Matn:*\n"
+        "Ovozli xabar yoki MP3/OGG fayl yuboring → PDF/DOCX qaytaraman\n\n"
+        "📄 *Fayl → Audio:*\n"
+        "PDF yoki DOCX fayl yuboring → MP3 audio qaytaraman\n\n"
+        "⚙️ *Sozlamalar:*\n"
+        "/til — tilni tanlash\n"
+        "/format — PDF yoki DOCX\n"
+        "/sozlamalar — joriy sozlamalar"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -176,13 +207,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🆘 *Yordam*\n\n"
-        "/start — Botni ishga tushirish\n"
-        "/til — Audio tilini tanlash\n"
-        "/format — PDF yoki DOCX tanlash\n"
-        "/sozlamalar — Joriy sozlamalar\n\n"
-        "📎 Qo'llab-quvvatlanadigan formatlar:\n"
-        "• Telegram ovozli xabar (🎤)\n"
-        "• MP3, OGG, WAV, M4A, FLAC fayllar",
+        "🎙️ *Audio → Matn:*\n"
+        "• Ovozli xabar yuboring\n"
+        "• MP3, OGG, WAV, M4A fayl yuboring\n\n"
+        "📄 *Fayl → Audio:*\n"
+        "• PDF fayl yuboring\n"
+        "• DOCX fayl yuboring\n\n"
+        "📌 *Buyruqlar:*\n"
+        "/til — tilni tanlash\n"
+        "/format — chiqish formatini tanlash\n"
+        "/sozlamalar — joriy sozlamalar",
         parse_mode="Markdown"
     )
 
@@ -211,14 +245,12 @@ async def choose_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def choose_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [
-            InlineKeyboardButton("📝 Word (DOCX)", callback_data="fmt:DOCX"),
-            InlineKeyboardButton("📄 PDF", callback_data="fmt:PDF"),
-        ]
-    ]
+    keyboard = [[
+        InlineKeyboardButton("📝 Word (DOCX)", callback_data="fmt:DOCX"),
+        InlineKeyboardButton("📄 PDF", callback_data="fmt:PDF"),
+    ]]
     await update.message.reply_text(
-        "📋 Chiqish formatini tanlang:",
+        "📋 Audio→Matn uchun format tanlang:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -227,16 +259,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     uid = query.from_user.id
     await query.answer()
-
-    data = query.data
     user_settings.setdefault(uid, {"lang": "uz-UZ", "format": "DOCX"})
 
+    data = query.data
     if data.startswith("lang:"):
         code = data.split(":")[1]
         user_settings[uid]["lang"] = code
         lang_name = next((k for k, v in LANGUAGES.items() if v == code), code)
         await query.edit_message_text(f"✅ Til o'rnatildi: *{lang_name}*", parse_mode="Markdown")
-
     elif data.startswith("fmt:"):
         fmt = data.split(":")[1]
         user_settings[uid]["format"] = fmt
@@ -244,10 +274,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Audio → Matn (PDF/DOCX)"""
     uid = update.effective_user.id
     user_settings.setdefault(uid, {"lang": "uz-UZ", "format": "DOCX"})
 
-    # Audio manbasini aniqlash
     audio_obj = None
     file_name = "audio"
 
@@ -257,59 +287,41 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.audio:
         audio_obj = update.message.audio
         file_name = update.message.audio.file_name or "audio"
-    elif update.message.document:
-        doc = update.message.document
-        if doc.mime_type and doc.mime_type.startswith("audio"):
-            audio_obj = doc
-            file_name = doc.file_name or "audio"
-        else:
-            await update.message.reply_text("❌ Faqat audio fayl yuboring!")
-            return
-    else:
-        await update.message.reply_text("❌ Audio topilmadi!")
+
+    if not audio_obj:
         return
 
-    # Fayl hajmini tekshirish (20MB limit)
     if audio_obj.file_size and audio_obj.file_size > 20 * 1024 * 1024:
         await update.message.reply_text("❌ Fayl hajmi 20MB dan oshmasligi kerak!")
         return
 
     msg = await update.message.reply_text("⏳ Audio qabul qilindi, ishlanmoqda...")
-
-    tmp_input = None
-    tmp_wav = None
-    tmp_output = None
+    tmp_input = tmp_wav = tmp_output = None
 
     try:
-        # Faylni yuklab olish
         await msg.edit_text("📥 Fayl yuklanmoqda...")
         tg_file = await audio_obj.get_file()
         ext = os.path.splitext(file_name)[1] or ".ogg"
         tmp_input = tempfile.mktemp(suffix=ext)
         await tg_file.download_to_drive(tmp_input)
 
-        # WAV ga aylantirish
         await msg.edit_text("🔄 Audio tayyorlanmoqda...")
         tmp_wav = convert_to_wav(tmp_input)
 
-        # Matnni ajratish
         lang = get_user_lang(uid)
-        await msg.edit_text("🎙️ Matn ajratilmoqda... (biroz kuting)")
+        await msg.edit_text("🎙️ Matn ajratilmoqda...")
         text = await asyncio.get_event_loop().run_in_executor(
             None, recognize_audio, tmp_wav, lang
         )
 
         if not text:
             await msg.edit_text(
-                "❌ Matn ajratib bo'lmadi.\n\n"
-                "Sabab bo'lishi mumkin:\n"
-                "• Audio sifati past\n"
-                "• Noto'g'ri til tanlangan (/til)\n"
-                "• Audio da ovoz yo'q"
+                "❌ Matn ajratib bo'lmadi.\n"
+                "• Audio sifatini tekshiring\n"
+                "• /til bilan tilni o'zgartiring"
             )
             return
 
-        # Fayl yaratish
         fmt = get_user_format(uid)
         await msg.edit_text(f"📄 {fmt} fayl tayyorlanmoqda...")
 
@@ -324,46 +336,162 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             out_name = os.path.splitext(file_name)[0] + "_matn.pdf"
 
-        # Natijani yuborish
-        word_count = len(text.split())
-        caption = (
-            f"✅ *Tayyor!*\n\n"
-            f"🌐 Til: `{lang}`\n"
-            f"📊 So'zlar: `{word_count}`\n"
-            f"📄 Format: `{fmt}`"
-        )
-
         await msg.delete()
 
-        # Matnni ham yuborish (qisqa bo'lsa)
         if len(text) <= 800:
-            await update.message.reply_text(
-                f"📝 *Ajratilgan matn:*\n\n{text}",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text(f"📝 *Matn:*\n\n{text}", parse_mode="Markdown")
 
         with open(tmp_output, "rb") as f:
             await update.message.reply_document(
                 document=f,
                 filename=out_name,
-                caption=caption,
+                caption=f"✅ *Tayyor!*\n🌐 Til: `{lang}`\n📊 So'zlar: `{len(text.split())}`\n📄 Format: `{fmt}`",
                 parse_mode="Markdown"
             )
 
     except Exception as e:
-        logger.error(f"Xatolik: {e}")
-        await msg.edit_text(f"❌ Xatolik yuz berdi:\n`{str(e)}`", parse_mode="Markdown")
-
+        logger.error(f"Audio xatolik: {e}")
+        await msg.edit_text(f"❌ Xatolik:\n`{str(e)}`", parse_mode="Markdown")
     finally:
         for tmp in [tmp_input, tmp_wav, tmp_output]:
             if tmp and os.path.exists(tmp):
                 os.remove(tmp)
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PDF/DOCX → Audio (MP3) yoki Audio fayl → Matn"""
+    uid = update.effective_user.id
+    user_settings.setdefault(uid, {"lang": "uz-UZ", "format": "DOCX"})
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    file_name = doc.file_name or "fayl"
+    ext = os.path.splitext(file_name)[1].lower()
+
+    # Audio fayl bo'lsa → matnга
+    if ext in [".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"]:
+        if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+            await update.message.reply_text("❌ Fayl hajmi 20MB dan oshmasligi kerak!")
+            return
+
+        msg = await update.message.reply_text("⏳ Audio fayl qabul qilindi...")
+        tmp_input = tmp_wav = tmp_output = None
+
+        try:
+            await msg.edit_text("📥 Yuklanmoqda...")
+            tg_file = await doc.get_file()
+            tmp_input = tempfile.mktemp(suffix=ext)
+            await tg_file.download_to_drive(tmp_input)
+
+            await msg.edit_text("🔄 Tayyorlanmoqda...")
+            tmp_wav = convert_to_wav(tmp_input)
+
+            lang = get_user_lang(uid)
+            await msg.edit_text("🎙️ Matn ajratilmoqda...")
+            text = await asyncio.get_event_loop().run_in_executor(
+                None, recognize_audio, tmp_wav, lang
+            )
+
+            if not text:
+                await msg.edit_text("❌ Matn ajratib bo'lmadi.")
+                return
+
+            fmt = get_user_format(uid)
+            if fmt == "DOCX":
+                tmp_output = await asyncio.get_event_loop().run_in_executor(
+                    None, make_docx, text, file_name
+                )
+                out_name = os.path.splitext(file_name)[0] + "_matn.docx"
+            else:
+                tmp_output = await asyncio.get_event_loop().run_in_executor(
+                    None, make_pdf, text, file_name
+                )
+                out_name = os.path.splitext(file_name)[0] + "_matn.pdf"
+
+            await msg.delete()
+            if len(text) <= 800:
+                await update.message.reply_text(f"📝 *Matn:*\n\n{text}", parse_mode="Markdown")
+
+            with open(tmp_output, "rb") as f:
+                await update.message.reply_document(
+                    document=f, filename=out_name,
+                    caption=f"✅ *Tayyor!* 📄 {fmt}",
+                    parse_mode="Markdown"
+                )
+
+        except Exception as e:
+            logger.error(f"Xatolik: {e}")
+            await msg.edit_text(f"❌ Xatolik:\n`{str(e)}`", parse_mode="Markdown")
+        finally:
+            for tmp in [tmp_input, tmp_wav, tmp_output]:
+                if tmp and os.path.exists(tmp):
+                    os.remove(tmp)
+
+    # PDF yoki DOCX → Audio (MP3)
+    elif ext in [".pdf", ".docx"]:
+        if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+            await update.message.reply_text("❌ Fayl hajmi 20MB dan oshmasligi kerak!")
+            return
+
+        msg = await update.message.reply_text("⏳ Fayl qabul qilindi, ishlanmoqda...")
+        tmp_input = tmp_output = None
+
+        try:
+            await msg.edit_text("📥 Yuklanmoqda...")
+            tg_file = await doc.get_file()
+            tmp_input = tempfile.mktemp(suffix=ext)
+            await tg_file.download_to_drive(tmp_input)
+
+            await msg.edit_text("📖 Matn o'qilmoqda...")
+            text = extract_text_from_file(tmp_input, ext)
+
+            if not text or len(text.strip()) < 3:
+                await msg.edit_text("❌ Faylda matn topilmadi!")
+                return
+
+            lang = get_user_lang(uid)
+            await msg.edit_text("🔊 Audio tayyorlanmoqda...")
+            tmp_output = tempfile.mktemp(suffix=".mp3")
+            await text_to_audio(text, lang, tmp_output)
+
+            out_name = os.path.splitext(file_name)[0] + ".mp3"
+            await msg.delete()
+
+            with open(tmp_output, "rb") as f:
+                await update.message.reply_audio(
+                    audio=f,
+                    filename=out_name,
+                    caption=f"✅ *Tayyor!*\n🌐 Til: `{lang}`\n📊 So'zlar: `{len(text.split())}`",
+                    parse_mode="Markdown"
+                )
+
+        except Exception as e:
+            logger.error(f"Xatolik: {e}")
+            await msg.edit_text(f"❌ Xatolik:\n`{str(e)}`", parse_mode="Markdown")
+        finally:
+            for tmp in [tmp_input, tmp_output]:
+                if tmp and os.path.exists(tmp):
+                    os.remove(tmp)
+
+    else:
+        await update.message.reply_text(
+            "❌ Qo'llab-quvvatlanmaydigan format!\n\n"
+            "Qabul qilinadi:\n"
+            "🎙️ Audio: MP3, WAV, OGG, M4A\n"
+            "📄 Hujjat: PDF, DOCX"
+        )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎙️ Iltimos, audio fayl yoki ovozli xabar yuboring!\n\n"
-        "Yordam: /help"
+        "📌 Menga quyidagilarni yuboring:\n\n"
+        "🎙️ Ovozli xabar → Matn (PDF/DOCX)\n"
+        "🎵 Audio fayl (MP3/OGG) → Matn\n"
+        "📄 PDF/DOCX fayl → Audio (MP3)\n\n"
+        "/til — tilni o'zgartirish\n"
+        "/help — yordam"
     )
 
 
@@ -372,8 +500,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if BOT_TOKEN == "BU_YERGA_TOKEN_QOYING":
         print("❌ BOT_TOKEN o'rnatilmagan!")
-        print("   .env faylga yoki environment variable ga qo'shing:")
-        print("   BOT_TOKEN=1234567890:ABCdef...")
         return
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -384,7 +510,9 @@ def main():
     app.add_handler(CommandHandler("format", choose_format))
     app.add_handler(CommandHandler("sozlamalar", settings_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.ALL, handle_audio))
+    app.add_handler(MessageHandler(filters.VOICE, handle_audio))
+    app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("🤖 Bot ishga tushdi!")
